@@ -6,6 +6,7 @@ from app.api.models.APIResponseModel import ResponseModel, ErrorResponseModel  #
 
 # 爬虫/Crawler
 from crawlers.hybrid.hybrid_crawler import HybridCrawler  # 导入混合爬虫
+from crawlers.utils.cookie_manager import CookiePool
 
 HybridCrawler = HybridCrawler()  # 实例化混合爬虫
 
@@ -52,62 +53,146 @@ async def hybrid_parsing_single_video(request: Request,
                                     )
         raise HTTPException(status_code=status_code, detail=detail.dict())
 
-# 更新Cookie
+
+# 更新Cookie（入池模式：不再替换单 Cookie，而是加入 Cookie 池统一管理）
 @router.post("/update_cookie",
              response_model=ResponseModel,
-             summary="更新Cookie/Update Cookie")
+             summary="更新Cookie/Update Cookie (入池)")
 async def update_cookie_api(request: Request,
                            service: str = Body(example="douyin", description="服务名称/Service name"),
                            cookie: str = Body(example="YOUR_NEW_COOKIE", description="新的Cookie值/New Cookie value")):
     """
     # [中文]
     ### 用途:
-    - 更新指定服务的Cookie
+    - 将新的 Cookie 加入指定服务的 Cookie 池。
+    - 系统会自动管理池中的多个 Cookie，按成功率加权轮转，失效自动降级。
     ### 参数:
-    - service: 服务名称 (如: douyin_web)
+    - service: 服务名称 (douyin / tiktok)
     - cookie: 新的Cookie值
     ### 返回:
-    - 更新结果
+    - 入池结果及池状态
 
     # [English]
     ### Purpose:
-    - Update Cookie for specified service
+    - Add a new Cookie to the Cookie pool for the specified service.
+    - The system automatically manages multiple cookies with weighted rotation and auto-degradation.
     ### Parameters:
-    - service: Service name (e.g.: douyin_web)
+    - service: Service name (douyin / tiktok)
     - cookie: New Cookie value
     ### Return:
-    - Update result
+    - Pool add result and pool status
 
     # [示例/Example]
-    service = "douyin_web"
+    service = "douyin"
     cookie = "YOUR_NEW_COOKIE"
     """
     try:
-        if service == "douyin":
-            from crawlers.douyin.web.web_crawler import DouyinWebCrawler
-            douyin_crawler = DouyinWebCrawler()
-            await douyin_crawler.update_cookie(cookie)
-            return ResponseModel(code=200,
-                                router=request.url.path,
-                                data={"message": f"Cookie for {service} updated successfully"})
-        elif service == "tiktok":
-            # 这里可以添加TikTok的cookie更新逻辑
-            # from crawlers.tiktok.web.web_crawler import TikTokWebCrawler
-            # tiktok_crawler = TikTokWebCrawler()
-            # await tiktok_crawler.update_cookie(cookie)
-            return ResponseModel(code=200,
-                                router=request.url.path,
-                                data={"message": f"Cookie for {service} will be updated (not implemented yet)"})
-        elif service == "bilibili":
-            # 这里可以添加Bilibili的cookie更新逻辑
-            # from crawlers.bilibili.web.web_crawler import BilibiliWebCrawler
-            # bilibili_crawler = BilibiliWebCrawler()
-            # await bilibili_crawler.update_cookie(cookie)
-            return ResponseModel(code=200,
-                                router=request.url.path,
-                                data={"message": f"Cookie for {service} will be updated (not implemented yet)"})
-        else:
-            raise ValueError(f"Service '{service}' is not supported. Supported services: douyin, tiktok, bilibili")
+        if service not in ("douyin", "tiktok"):
+            raise ValueError(f"不支持的服务 '{service}'。支持的服务: douyin, tiktok")
+
+        pool = CookiePool.get_instance(service)
+        added = await pool.add_cookie(cookie, source="api")
+        status = await pool.get_pool_status()
+
+        return ResponseModel(
+            code=200,
+            router=request.url.path,
+            data={
+                "message": f"Cookie 已{'加入' if added else '跳过（已存在或池满）'} {service} 池",
+                "added": added,
+                "pool_status": status,
+            }
+        )
+    except Exception as e:
+        status_code = 400
+        detail = ErrorResponseModel(code=status_code,
+                                    router=request.url.path,
+                                    params=dict(request.query_params),
+                                    )
+        raise HTTPException(status_code=status_code, detail=detail.dict())
+
+
+# 获取 Cookie 池状态
+@router.get("/cookie_pool_status",
+            response_model=ResponseModel,
+            summary="获取Cookie池状态/Get Cookie pool status")
+async def cookie_pool_status_api(request: Request,
+                                  service: str = Query(default="douyin", description="服务名称/Service name")):
+    """
+    # [中文]
+    ### 用途:
+    - 查看指定服务的 Cookie 池状态，包括每个 Cookie 的成功/失败次数、权重等。
+    ### 参数:
+    - service: 服务名称 (douyin / tiktok)
+    ### 返回:
+    - 池状态快照
+
+    # [English]
+    ### Purpose:
+    - View the Cookie pool status for the specified service.
+    ### Parameters:
+    - service: Service name (douyin / tiktok)
+    ### Return:
+    - Pool status snapshot
+    """
+    try:
+        if service not in ("douyin", "tiktok"):
+            raise ValueError(f"不支持的服务 '{service}'。支持的服务: douyin, tiktok")
+
+        pool = CookiePool.get_instance(service)
+        status = await pool.get_pool_status()
+        return ResponseModel(code=200,
+                             router=request.url.path,
+                             data=status)
+    except Exception as e:
+        status_code = 400
+        detail = ErrorResponseModel(code=status_code,
+                                    router=request.url.path,
+                                    params=dict(request.query_params),
+                                    )
+        raise HTTPException(status_code=status_code, detail=detail.dict())
+
+
+# 从浏览器自动提取 Cookie
+@router.post("/extract_browser_cookies",
+             response_model=ResponseModel,
+             summary="从浏览器自动提取Cookie/Extract cookies from browser")
+async def extract_browser_cookies_api(request: Request,
+                                       service: str = Body(default="douyin", description="服务名称/Service name")):
+    """
+    # [中文]
+    ### 用途:
+    - 从本地浏览器（Chrome/Firefox/Edge）自动提取对应平台的 Cookie 并加入池中。
+    ### 参数:
+    - service: 服务名称 (douyin / tiktok)
+    ### 返回:
+    - 提取结果及池状态
+
+    # [English]
+    ### Purpose:
+    - Auto-extract cookies from local browsers (Chrome/Firefox/Edge) and add to pool.
+    ### Parameters:
+    - service: Service name (douyin / tiktok)
+    ### Return:
+    - Extraction result and pool status
+    """
+    try:
+        if service not in ("douyin", "tiktok"):
+            raise ValueError(f"不支持的服务 '{service}'。支持的服务: douyin, tiktok")
+
+        pool = CookiePool.get_instance(service)
+        count = await pool.auto_extract_from_browser()
+        status = await pool.get_pool_status()
+
+        return ResponseModel(
+            code=200,
+            router=request.url.path,
+            data={
+                "message": f"从浏览器提取到 {count} 个新 Cookie",
+                "extracted": count,
+                "pool_status": status,
+            }
+        )
     except Exception as e:
         status_code = 400
         detail = ErrorResponseModel(code=status_code,

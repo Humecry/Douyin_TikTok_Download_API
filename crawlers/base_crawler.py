@@ -51,6 +51,19 @@ from crawlers.utils.api_exceptions import (
     APIRateLimitError,
     APIRetryExhaustedError,
 )
+from crawlers.utils.cookie_manager import is_cookie_failure_response
+
+
+class CookieFailureError(APIError):
+    """当检测到 Cookie 失效时抛出，调用方可据此切换 Cookie 重试"""
+
+    def __init__(self, message: str = "", status_code: int = None, response_body: str = ""):
+        super().__init__(status_code)
+        self.message = message
+        self.response_body = response_body
+
+    def display_error(self):
+        return f"Cookie Failure Error: {self.message}"
 
 
 class BaseCrawler:
@@ -66,6 +79,7 @@ class BaseCrawler:
             timeout: int = 10,
             max_tasks: int = 50,
             crawler_headers: dict = {},
+            cookie_str: str = "",
     ):
         if isinstance(proxies, dict):
             self.proxies = proxies
@@ -75,6 +89,12 @@ class BaseCrawler:
 
         # 爬虫请求头 / Crawler request header
         self.crawler_headers = crawler_headers or {}
+
+        # 当前使用的 Cookie 字符串 (用于 Cookie 池追踪)
+        self.cookie_str = cookie_str
+
+        # 是否启用 Cookie 失效检测 (由调用方控制)
+        self._detect_cookie_failure = True
 
         # 异步的任务数 / Number of asynchronous tasks
         self._max_tasks = max_tasks
@@ -186,8 +206,8 @@ class BaseCrawler:
                 response = await self.aclient.get(url, follow_redirects=True)
                 if not response.text.strip() or not response.content:
                     error_message = "第 {0} 次响应内容为空, 状态码: {1}, URL:{2}".format(attempt + 1,
-                                                                                         response.status_code,
-                                                                                         response.url)
+                                                                                          response.status_code,
+                                                                                          response.url)
 
                     logger.warning(error_message)
 
@@ -200,8 +220,23 @@ class BaseCrawler:
                     continue
 
                 # logger.info("响应状态码: {0}".format(response.status_code))
+
+                # Cookie 失效检测
+                if self._detect_cookie_failure and is_cookie_failure_response(
+                    response.status_code, response.text
+                ):
+                    raise CookieFailureError(
+                        message=f"Cookie 可能已失效 (状态码: {response.status_code})",
+                        status_code=response.status_code,
+                        response_body=response.text[:500],
+                    )
+
                 response.raise_for_status()
                 return response
+
+            except CookieFailureError:
+                # 不重试，直接抛出给调用方切换 Cookie
+                raise
 
             except httpx.RequestError:
                 raise APIConnectionError("连接端点失败，检查网络环境或代理：{0} 代理：{1} 类名：{2}"
@@ -235,8 +270,8 @@ class BaseCrawler:
                 )
                 if not response.text.strip() or not response.content:
                     error_message = "第 {0} 次响应内容为空, 状态码: {1}, URL:{2}".format(attempt + 1,
-                                                                                         response.status_code,
-                                                                                         response.url)
+                                                                                          response.status_code,
+                                                                                          response.url)
 
                     logger.warning(error_message)
 
@@ -249,8 +284,23 @@ class BaseCrawler:
                     continue
 
                 # logger.info("响应状态码: {0}".format(response.status_code))
+
+                # Cookie 失效检测
+                if self._detect_cookie_failure and is_cookie_failure_response(
+                    response.status_code, response.text
+                ):
+                    raise CookieFailureError(
+                        message=f"Cookie 可能已失效 (状态码: {response.status_code})",
+                        status_code=response.status_code,
+                        response_body=response.text[:500],
+                    )
+
                 response.raise_for_status()
                 return response
+
+            except CookieFailureError:
+                # 不重试，直接抛出给调用方切换 Cookie
+                raise
 
             except httpx.RequestError:
                 raise APIConnectionError(

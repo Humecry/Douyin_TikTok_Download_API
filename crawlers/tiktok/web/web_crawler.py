@@ -39,7 +39,7 @@ import yaml  # 配置文件
 import os  # 系统操作
 
 # 基础爬虫客户端和TikTokAPI端点
-from crawlers.base_crawler import BaseCrawler
+from crawlers.base_crawler import BaseCrawler, CookieFailureError
 from crawlers.tiktok.web.endpoints import TikTokAPIEndpoints
 from crawlers.utils.utils import extract_valid_urls
 
@@ -66,6 +66,9 @@ from crawlers.tiktok.web.models import (
     UserFollow
 )
 
+from crawlers.utils.cookie_manager import CookiePool
+from crawlers.utils.logger import logger
+
 
 # 配置文件路径
 path = os.path.abspath(os.path.dirname(__file__))
@@ -74,209 +77,224 @@ path = os.path.abspath(os.path.dirname(__file__))
 with open(f"{path}/config.yaml", "r", encoding="utf-8") as f:
     config = yaml.safe_load(f)
 
+# Cookie 池单例（模块级，全局共享）
+_cookie_pool = CookiePool.get_instance("tiktok")
+# 从 config.yaml 种子（向后兼容）
+_cookie_pool.seed_from_config(config, f"{path}/config.yaml")
+
+# Cookie 轮转最大尝试次数
+COOKIE_RETRY_MAX = 3
+
 
 class TikTokWebCrawler:
 
     def __init__(self):
         self.proxy_pool = None
+        self.cookie_pool = _cookie_pool
 
-    # 从配置文件中获取TikTok的请求头
-    async def get_tiktok_headers(self):
+    # 从 Cookie 池获取请求头
+    async def get_tiktok_headers(self, cookie: str = None):
+        """
+        获取TikTok请求头。
+
+        优先使用传入的 cookie，否则从 Cookie 池获取。
+        """
         tiktok_config = config["TokenManager"]["tiktok"]
+
+        # 如果没有传入 cookie，从池中获取
+        if cookie is None:
+            cookie = await self.cookie_pool.get_cookie()
+
         kwargs = {
             "headers": {
                 "User-Agent": tiktok_config["headers"]["User-Agent"],
                 "Referer": tiktok_config["headers"]["Referer"],
-                "Cookie": tiktok_config["headers"]["Cookie"],
+                "Cookie": cookie,
             },
             "proxies": {"http://": tiktok_config["proxies"]["http"],
                         "https://": tiktok_config["proxies"]["https"]}
         }
         return kwargs
 
+    # Cookie 感知的请求包装器
+    async def _fetch_with_cookie_rotation(self, fetch_fn, *args, **kwargs):
+        """
+        用 Cookie 轮转包装一个异步请求函数。
+
+        流程:
+        1. 从池获取 Cookie → 构建 headers → 创建 BaseCrawler
+        2. 执行请求
+        3. 若触发 CookieFailureError → 标记失败 → 换 Cookie 重试
+        4. 成功 → 标记成功 → 返回结果
+        """
+        last_error = None
+
+        for attempt in range(COOKIE_RETRY_MAX):
+            headers_kwargs = await self.get_tiktok_headers()
+            current_cookie = headers_kwargs["headers"]["Cookie"]
+
+            base_crawler = BaseCrawler(
+                proxies=headers_kwargs["proxies"],
+                crawler_headers=headers_kwargs["headers"],
+                cookie_str=current_cookie,
+            )
+
+            try:
+                async with base_crawler as crawler:
+                    result = await fetch_fn(crawler, headers_kwargs, *args, **kwargs)
+
+                await self.cookie_pool.mark_success(current_cookie)
+                return result
+
+            except CookieFailureError as e:
+                logger.warning(
+                    f"[TikTokWebCrawler] Cookie 失效 (尝试 {attempt + 1}/{COOKIE_RETRY_MAX}), "
+                    f"切换 Cookie 重试. 原因: {e.message}"
+                )
+                await self.cookie_pool.mark_failure(
+                    current_cookie, reason=str(e.message)
+                )
+                last_error = e
+                continue
+
+            except Exception:
+                raise
+
+        raise CookieFailureError(
+            message=f"所有 Cookie 均已尝试 ({COOKIE_RETRY_MAX} 次)，请求失败",
+            status_code=getattr(last_error, 'status_code', None),
+        )
+
     """-------------------------------------------------------handler接口列表-------------------------------------------------------"""
 
     # 获取单个作品数据
     async def fetch_one_video(self, itemId: str):
-        # 获取TikTok的实时Cookie
-        kwargs = await self.get_tiktok_headers()
-        # 创建一个基础爬虫
-        base_crawler = BaseCrawler(proxies=kwargs["proxies"], crawler_headers=kwargs["headers"])
-        async with base_crawler as crawler:
-            # 创建一个作品详情的BaseModel参数
+        async def _fetch(crawler, headers_kwargs):
             params = PostDetail(itemId=itemId)
-            # 生成一个作品详情的带有加密参数的Endpoint
             endpoint = BogusManager.model_2_endpoint(
-                TikTokAPIEndpoints.POST_DETAIL, params.dict(), kwargs["headers"]["User-Agent"]
+                TikTokAPIEndpoints.POST_DETAIL, params.dict(), headers_kwargs["headers"]["User-Agent"]
             )
-            response = await crawler.fetch_get_json(endpoint)
-        return response
+            return await crawler.fetch_get_json(endpoint)
+
+        return await self._fetch_with_cookie_rotation(_fetch)
 
     # 获取用户的个人信息
     async def fetch_user_profile(self, secUid: str, uniqueId: str):
-        # 获取TikTok的实时Cookie
-        kwargs = await self.get_tiktok_headers()
-        # 创建一个基础爬虫
-        base_crawler = BaseCrawler(proxies=kwargs["proxies"], crawler_headers=kwargs["headers"])
-        async with base_crawler as crawler:
-            # 创建一个用户详情的BaseModel参数
+        async def _fetch(crawler, headers_kwargs):
             params = UserProfile(secUid=secUid, uniqueId=uniqueId)
-            # 生成一个用户详情的带有加密参数的Endpoint
             endpoint = BogusManager.model_2_endpoint(
-                TikTokAPIEndpoints.USER_DETAIL, params.dict(), kwargs["headers"]["User-Agent"]
+                TikTokAPIEndpoints.USER_DETAIL, params.dict(), headers_kwargs["headers"]["User-Agent"]
             )
-            response = await crawler.fetch_get_json(endpoint)
-        return response
+            return await crawler.fetch_get_json(endpoint)
+
+        return await self._fetch_with_cookie_rotation(_fetch)
 
     # 获取用户的作品列表
     async def fetch_user_post(self, secUid: str, cursor: int = 0, count: int = 35, coverFormat: int = 2):
-        # 获取TikTok的实时Cookie
-        kwargs = await self.get_tiktok_headers()
-        # proxies = {"http://": 'http://43.159.29.191:24144', "https://": 'http://43.159.29.191:24144'}
-        # 创建一个基础爬虫
-        base_crawler = BaseCrawler(proxies=kwargs["proxies"], crawler_headers=kwargs["headers"])
-        async with base_crawler as crawler:
-            # 创建一个用户作品的BaseModel参数
+        async def _fetch(crawler, headers_kwargs):
             params = UserPost(secUid=secUid, cursor=cursor, count=count, coverFormat=coverFormat)
-            # 生成一个用户作品的带有加密参数的Endpoint
             endpoint = BogusManager.model_2_endpoint(
-                TikTokAPIEndpoints.USER_POST, params.dict(), kwargs["headers"]["User-Agent"]
+                TikTokAPIEndpoints.USER_POST, params.dict(), headers_kwargs["headers"]["User-Agent"]
             )
-            response = await crawler.fetch_get_json(endpoint)
-        return response
+            return await crawler.fetch_get_json(endpoint)
+
+        return await self._fetch_with_cookie_rotation(_fetch)
 
     # 获取用户的点赞列表
     async def fetch_user_like(self, secUid: str, cursor: int = 0, count: int = 30, coverFormat: int = 2):
-        # 获取TikTok的实时Cookie
-        kwargs = await self.get_tiktok_headers()
-        # 创建一个基础爬虫
-        base_crawler = BaseCrawler(proxies=kwargs["proxies"], crawler_headers=kwargs["headers"])
-        async with base_crawler as crawler:
-            # 创建一个用户点赞的BaseModel参数
+        async def _fetch(crawler, headers_kwargs):
             params = UserLike(secUid=secUid, cursor=cursor, count=count, coverFormat=coverFormat)
-            # 生成一个用户点赞的带有加密参数的Endpoint
             endpoint = BogusManager.model_2_endpoint(
-                TikTokAPIEndpoints.USER_LIKE, params.dict(), kwargs["headers"]["User-Agent"]
+                TikTokAPIEndpoints.USER_LIKE, params.dict(), headers_kwargs["headers"]["User-Agent"]
             )
-            response = await crawler.fetch_get_json(endpoint)
-        return response
+            return await crawler.fetch_get_json(endpoint)
 
-    # 获取用户的收藏列表
+        return await self._fetch_with_cookie_rotation(_fetch)
+
+    # 获取用户的收藏列表（用户提供自己的Cookie）
     async def fetch_user_collect(self, cookie: str, secUid: str, cursor: int = 0, count: int = 30,
-                                 coverFormat: int = 2):
-        # 获取TikTok的实时Cookie
-        kwargs = await self.get_tiktok_headers()
-        kwargs["headers"]["Cookie"] = cookie
-        # 创建一个基础爬虫
-        base_crawler = BaseCrawler(proxies=kwargs["proxies"], crawler_headers=kwargs["headers"])
+                                  coverFormat: int = 2):
+        # 用户提供自己的 Cookie 时不使用池轮转
+        headers_kwargs = await self.get_tiktok_headers(cookie=cookie)
+        base_crawler = BaseCrawler(
+            proxies=headers_kwargs["proxies"],
+            crawler_headers=headers_kwargs["headers"],
+            cookie_str=cookie,
+        )
         async with base_crawler as crawler:
-            # 创建一个用户收藏的BaseModel参数
             params = UserCollect(cookie=cookie, secUid=secUid, cursor=cursor, count=count, coverFormat=coverFormat)
-            # 生成一个用户收藏的带有加密参数的Endpoint
             endpoint = BogusManager.model_2_endpoint(
-                TikTokAPIEndpoints.USER_COLLECT, params.dict(), kwargs["headers"]["User-Agent"]
+                TikTokAPIEndpoints.USER_COLLECT, params.dict(), headers_kwargs["headers"]["User-Agent"]
             )
-            response = await crawler.fetch_get_json(endpoint)
-        return response
+            return await crawler.fetch_get_json(endpoint)
 
     # 获取用户的播放列表
     async def fetch_user_play_list(self, secUid: str, cursor: int = 0, count: int = 30):
-        # 获取TikTok的实时Cookie
-        kwargs = await self.get_tiktok_headers()
-        # 创建一个基础爬虫
-        base_crawler = BaseCrawler(proxies=kwargs["proxies"], crawler_headers=kwargs["headers"])
-        async with base_crawler as crawler:
-            # 创建一个用户播放列表的BaseModel参数
+        async def _fetch(crawler, headers_kwargs):
             params = UserPlayList(secUid=secUid, cursor=cursor, count=count)
-            # 生成一个用户播放列表的带有加密参数的Endpoint
             endpoint = BogusManager.model_2_endpoint(
-                TikTokAPIEndpoints.USER_PLAY_LIST, params.dict(), kwargs["headers"]["User-Agent"]
+                TikTokAPIEndpoints.USER_PLAY_LIST, params.dict(), headers_kwargs["headers"]["User-Agent"]
             )
-            response = await crawler.fetch_get_json(endpoint)
-        return response
+            return await crawler.fetch_get_json(endpoint)
+
+        return await self._fetch_with_cookie_rotation(_fetch)
 
     # 获取用户的合辑列表
     async def fetch_user_mix(self, mixId: str, cursor: int = 0, count: int = 30):
-        # 获取TikTok的实时Cookie
-        kwargs = await self.get_tiktok_headers()
-        # 创建一个基础爬虫
-        base_crawler = BaseCrawler(proxies=kwargs["proxies"], crawler_headers=kwargs["headers"])
-        async with base_crawler as crawler:
-            # 创建一个用户合辑的BaseModel参数
+        async def _fetch(crawler, headers_kwargs):
             params = UserMix(mixId=mixId, cursor=cursor, count=count)
-            # 生成一个用户合辑的带有加密参数的Endpoint
             endpoint = BogusManager.model_2_endpoint(
-                TikTokAPIEndpoints.USER_MIX, params.dict(), kwargs["headers"]["User-Agent"]
+                TikTokAPIEndpoints.USER_MIX, params.dict(), headers_kwargs["headers"]["User-Agent"]
             )
-            response = await crawler.fetch_get_json(endpoint)
-        return response
+            return await crawler.fetch_get_json(endpoint)
+
+        return await self._fetch_with_cookie_rotation(_fetch)
 
     # 获取作品的评论列表
     async def fetch_post_comment(self, aweme_id: str, cursor: int = 0, count: int = 20, current_region: str = ""):
-        # 获取TikTok的实时Cookie
-        kwargs = await self.get_tiktok_headers()
-        # proxies = {"http://": 'http://43.159.18.174:25263', "https://": 'http://43.159.18.174:25263'}
-        # 创建一个基础爬虫
-        base_crawler = BaseCrawler(proxies=kwargs["proxies"], crawler_headers=kwargs["headers"])
-        async with base_crawler as crawler:
-            # 创建一个作品评论的BaseModel参数
+        async def _fetch(crawler, headers_kwargs):
             params = PostComment(aweme_id=aweme_id, cursor=cursor, count=count, current_region=current_region)
-            # 生成一个作品评论的带有加密参数的Endpoint
             endpoint = BogusManager.model_2_endpoint(
-                TikTokAPIEndpoints.POST_COMMENT, params.dict(), kwargs["headers"]["User-Agent"]
+                TikTokAPIEndpoints.POST_COMMENT, params.dict(), headers_kwargs["headers"]["User-Agent"]
             )
-            response = await crawler.fetch_get_json(endpoint)
-        return response
+            return await crawler.fetch_get_json(endpoint)
+
+        return await self._fetch_with_cookie_rotation(_fetch)
 
     # 获取作品的评论回复列表
     async def fetch_post_comment_reply(self, item_id: str, comment_id: str, cursor: int = 0, count: int = 20,
-                                       current_region: str = ""):
-        # 获取TikTok的实时Cookie
-        kwargs = await self.get_tiktok_headers()
-        # 创建一个基础爬虫
-        base_crawler = BaseCrawler(proxies=kwargs["proxies"], crawler_headers=kwargs["headers"])
-        async with base_crawler as crawler:
-            # 创建一个作品评论的BaseModel参数
+                                        current_region: str = ""):
+        async def _fetch(crawler, headers_kwargs):
             params = PostCommentReply(item_id=item_id, comment_id=comment_id, cursor=cursor, count=count,
-                                      current_region=current_region)
-            # 生成一个作品评论的带有加密参数的Endpoint
+                                       current_region=current_region)
             endpoint = BogusManager.model_2_endpoint(
-                TikTokAPIEndpoints.POST_COMMENT_REPLY, params.dict(), kwargs["headers"]["User-Agent"]
+                TikTokAPIEndpoints.POST_COMMENT_REPLY, params.dict(), headers_kwargs["headers"]["User-Agent"]
             )
-            response = await crawler.fetch_get_json(endpoint)
-        return response
+            return await crawler.fetch_get_json(endpoint)
+
+        return await self._fetch_with_cookie_rotation(_fetch)
 
     # 获取用户的粉丝列表
     async def fetch_user_fans(self, secUid: str, count: int = 30, maxCursor: int = 0, minCursor: int = 0):
-        # 获取TikTok的实时Cookie
-        kwargs = await self.get_tiktok_headers()
-        # 创建一个基础爬虫
-        base_crawler = BaseCrawler(proxies=kwargs["proxies"], crawler_headers=kwargs["headers"])
-        async with base_crawler as crawler:
-            # 创建一个用户关注的BaseModel参数
+        async def _fetch(crawler, headers_kwargs):
             params = UserFans(secUid=secUid, count=count, maxCursor=maxCursor, minCursor=minCursor)
-            # 生成一个用户关注的带有加密参数的Endpoint
             endpoint = BogusManager.model_2_endpoint(
-                TikTokAPIEndpoints.USER_FANS, params.dict(), kwargs["headers"]["User-Agent"]
+                TikTokAPIEndpoints.USER_FANS, params.dict(), headers_kwargs["headers"]["User-Agent"]
             )
-            response = await crawler.fetch_get_json(endpoint)
-        return response
+            return await crawler.fetch_get_json(endpoint)
+
+        return await self._fetch_with_cookie_rotation(_fetch)
 
     # 获取用户的关注列表
     async def fetch_user_follow(self, secUid: str, count: int = 30, maxCursor: int = 0, minCursor: int = 0):
-        # 获取TikTok的实时Cookie
-        kwargs = await self.get_tiktok_headers()
-        # 创建一个基础爬虫
-        base_crawler = BaseCrawler(proxies=kwargs["proxies"], crawler_headers=kwargs["headers"])
-        async with base_crawler as crawler:
-            # 创建一个用户关注的BaseModel参数
+        async def _fetch(crawler, headers_kwargs):
             params = UserFollow(secUid=secUid, count=count, maxCursor=maxCursor, minCursor=minCursor)
-            # 生成一个用户关注的带有加密参数的Endpoint
             endpoint = BogusManager.model_2_endpoint(
-                TikTokAPIEndpoints.USER_FOLLOW, params.dict(), kwargs["headers"]["User-Agent"]
+                TikTokAPIEndpoints.USER_FOLLOW, params.dict(), headers_kwargs["headers"]["User-Agent"]
             )
-            response = await crawler.fetch_get_json(endpoint)
-        return response
+            return await crawler.fetch_get_json(endpoint)
+
+        return await self._fetch_with_cookie_rotation(_fetch)
 
     """-------------------------------------------------------utils接口列表-------------------------------------------------------"""
 
@@ -340,139 +358,28 @@ class TikTokWebCrawler:
         # 对于URL列表
         return await SecUserIdFetcher.get_all_uniqueid(urls)
 
+    async def update_cookie(self, cookie: str):
+        """
+        将新 Cookie 加入池中。
+
+        Args:
+            cookie: 新的Cookie值
+        """
+        logger.info(f"[TikTokWebCrawler] 收到 Cookie 更新请求，向池中添加")
+        added = await self.cookie_pool.add_cookie(cookie, source="webhook")
+        if added:
+            logger.info("[TikTokWebCrawler] Cookie 已入池")
+        else:
+            logger.info("[TikTokWebCrawler] Cookie 已存在或池满，跳过")
+        return {"added": added, "pool_status": await self.cookie_pool.get_pool_status()}
+
+    # 获取 Cookie 池状态
+    async def get_cookie_pool_status(self):
+        return await self.cookie_pool.get_pool_status()
+
     """-------------------------------------------------------main接口列表-------------------------------------------------------"""
 
     async def main(self):
-        # 获取单个作品数据
-        # item_id = "7369296852669205791"
-        # response = await self.fetch_one_video(item_id)
-        # print(response)
-
-        # 获取用户的个人信息
-        # secUid = "MS4wLjABAAAAfDPs6wbpBcMMb85xkvDGdyyyVAUS2YoVCT9P6WQ1bpuwEuPhL9eFtTmGvxw1lT2C"
-        # uniqueId = "c4shjaz"
-        # response = await self.fetch_user_profile(secUid, uniqueId)
-        # print(response)
-
-        # 获取用户的作品列表
-        # secUid = "MS4wLjABAAAAfDPs6wbpBcMMb85xkvDGdyyyVAUS2YoVCT9P6WQ1bpuwEuPhL9eFtTmGvxw1lT2C"
-        # cursor = 0
-        # count = 35
-        # coverFormat = 2
-        # response = await self.fetch_user_post(secUid, cursor, count, coverFormat)
-        # print(response)
-
-        # 获取用户的点赞列表
-        # secUid = "MS4wLjABAAAAq1iRXNduFZpY301UkVpJ1eQT60_NiWS9QQSeNqmNQEDJp0pOF8cpleNEdiJx5_IU"
-        # cursor = 0
-        # count = 30
-        # coverFormat = 2
-        # response = await self.fetch_user_like(secUid, cursor, count, coverFormat)
-        # print(response)
-
-        # 获取用户的收藏列表
-        # cookie = "put your cookie here"
-        # secUid = "MS4wLjABAAAAq1iRXNduFZpY301UkVpJ1eQT60_NiWS9QQSeNqmNQEDJp0pOF8cpleNEdiJx5_IU"
-        # cursor = 0
-        # count = 30
-        # coverFormat = 2
-        # response = await self.fetch_user_collect(cookie, secUid, cursor, count, coverFormat)
-        # print(response)
-
-        # 获取用户的播放列表
-        # secUid = "MS4wLjABAAAAtGboV-mJHSIQqh-SsG30QKweGhSqkr4xJLq1qqgAWDzu3vDO5LUhUcCP4UEY5LwC"
-        # cursor = 0
-        # count = 30
-        # response = await self.fetch_user_play_list(secUid, cursor, count)
-        # print(response)
-
-        # 获取用户的合辑列表
-        # mixId = "7101538765474106158"
-        # cursor = 0
-        # count = 30
-        # response = await self.fetch_user_mix(mixId, cursor, count)
-        # print(response)
-
-        # 获取作品的评论列表
-        # aweme_id = "7304809083817774382"
-        # cursor = 0
-        # count = 20
-        # current_region = ""
-        # response = await self.fetch_post_comment(aweme_id, cursor, count, current_region)
-        # print(response)
-
-        # 获取作品的评论回复列表
-        # item_id = "7304809083817774382"
-        # comment_id = "7304877760886588191"
-        # cursor = 0
-        # count = 20
-        # current_region = ""
-        # response = await self.fetch_post_comment_reply(item_id, comment_id, cursor, count, current_region)
-        # print(response)
-
-        # 获取用户的关注列表
-        # secUid = "MS4wLjABAAAAtGboV-mJHSIQqh-SsG30QKweGhSqkr4xJLq1qqgAWDzu3vDO5LUhUcCP4UEY5LwC"
-        # count = 30
-        # maxCursor = 0
-        # minCursor = 0
-        # response = await self.fetch_user_follow(secUid, count, maxCursor, minCursor)
-        # print(response)
-
-        # 获取用户的粉丝列表
-        # secUid = "MS4wLjABAAAAtGboV-mJHSIQqh-SsG30QKweGhSqkr4xJLq1qqgAWDzu3vDO5LUhUcCP4UEY5LwC"
-        # count = 30
-        # maxCursor = 0
-        # minCursor = 0
-        # response = await self.fetch_user_fans(secUid, count, maxCursor, minCursor)
-        # print(response)
-
-        """-------------------------------------------------------utils接口列表-------------------------------------------------------"""
-
-        # # 生成真实msToken
-        # response = await self.fetch_real_msToken()
-        # print(response)
-
-        # 生成ttwid
-        # cookie = "put your cookie here"
-        # response = await self.gen_ttwid(cookie)
-        # print(response)
-
-        # 生成xbogus
-        # url = "https://www.tiktok.com/api/item/detail/?WebIdLastTime=1712665533&aid=1988&app_language=en&app_name=tiktok_web&browser_language=en-US&browser_name=Mozilla&browser_online=true&browser_platform=Win32&browser_version=5.0%20%28Windows%29&channel=tiktok_web&cookie_enabled=true&device_id=7349090360347690538&device_platform=web_pc&focus_state=true&from_page=user&history_len=4&is_fullscreen=false&is_page_visible=true&language=en&os=windows&priority_region=US&referer=&region=US&root_referer=https%3A%2F%2Fwww.tiktok.com%2F&screen_height=1080&screen_width=1920&webcast_language=en&tz_name=America%2FTijuana&msToken=AYFCEapCLbMrS8uTLBoYdUMeeVLbCdFQ_QF_-OcjzJw1CPr4JQhWUtagy0k4a9IITAqi5Qxr2Vdh9mgCbyGxTnvWLa4ZVY6IiSf6lcST-tr0IXfl-r_ZTpzvWDoQfqOVsWCTlSNkhAwB-tap5g==&itemId=7339393672959757570"
-        # user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3"
-        # response = await self.gen_xbogus(url, user_agent)
-        # print(response)
-
-        # 提取单个用户secUid
-        # url = "https://www.tiktok.com/@tiktok"
-        # response = await self.get_sec_user_id(url)
-        # print(response)
-
-        # 提取多个用户secUid
-        # urls = ["https://www.tiktok.com/@tiktok", "https://www.tiktok.com/@taylorswift"]
-        # response = await self.get_all_sec_user_id(urls)
-        # print(response)
-
-        # 提取单个作品id
-        # url = "https://www.tiktok.com/@taylorswift/video/7162153915952352558"
-        # response = await self.get_aweme_id(url)
-        # print(response)
-
-        # 提取多个作品id
-        # urls = ["https://www.tiktok.com/@taylorswift/video/7162153915952352558", "https://www.tiktok.com/@taylorswift/video/7137077445680745771"]
-        # response = await self.get_all_aweme_id(urls)
-        # print(response)
-
-        # 获取用户unique_id
-        # url = "https://www.tiktok.com/@tiktok"
-        # response = await self.get_unique_id(url)
-        # print(response)
-
-        # 获取多个用户unique_id
-        # urls = ["https://www.tiktok.com/@tiktok", "https://www.tiktok.com/@taylorswift"]
-        # response = await self.get_all_unique_id(urls)
-        # print(response)
-
         # 占位
         pass
 
