@@ -48,6 +48,7 @@ async def hybrid_parsing_single_video(request: Request,
     except Exception as e:
         status_code = 400
         detail = ErrorResponseModel(code=status_code,
+                                    message=str(e),
                                     router=request.url.path,
                                     params=dict(request.query_params),
                                     )
@@ -106,6 +107,7 @@ async def update_cookie_api(request: Request,
     except Exception as e:
         status_code = 400
         detail = ErrorResponseModel(code=status_code,
+                                    message=str(e),
                                     router=request.url.path,
                                     params=dict(request.query_params),
                                     )
@@ -147,6 +149,111 @@ async def cookie_pool_status_api(request: Request,
     except Exception as e:
         status_code = 400
         detail = ErrorResponseModel(code=status_code,
+                                    message=str(e),
+                                    router=request.url.path,
+                                    params=dict(request.query_params),
+                                    )
+        raise HTTPException(status_code=status_code, detail=detail.dict())
+
+
+# 删除指定 Cookie
+@router.delete("/remove_cookie",
+               response_model=ResponseModel,
+               summary="删除指定Cookie/Remove a specific Cookie")
+async def remove_cookie_api(request: Request,
+                             service: str = Query(example="douyin", description="服务名称/Service name"),
+                             fingerprint: str = Query(example="a1b2c3d4", description="Cookie指纹（从 /cookie_pool_status 获取）/Cookie fingerprint")):
+    """
+    # [中文]
+    ### 用途:
+    - 按指纹删除指定服务 Cookie 池中的某个 Cookie。
+    - 指纹可从 GET /cookie_pool_status 返回的 cookies[].fingerprint 字段获取。
+    ### 参数:
+    - service: 服务名称 (douyin / tiktok)
+    - fingerprint: Cookie 指纹（8位 hex）
+    ### 返回:
+    - 删除结果及池状态
+
+    # [English]
+    ### Purpose:
+    - Remove a specific Cookie from the pool by its fingerprint.
+    ### Parameters:
+    - service: Service name (douyin / tiktok)
+    - fingerprint: Cookie fingerprint (8 hex chars, from /cookie_pool_status)
+    ### Return:
+    - Removal result and pool status
+    """
+    try:
+        if service not in ("douyin", "tiktok"):
+            raise ValueError(f"不支持的服务 '{service}'。支持的服务: douyin, tiktok")
+
+        pool = CookiePool.get_instance(service)
+        removed = await pool.remove_cookie(fingerprint)
+        status = await pool.get_pool_status()
+
+        return ResponseModel(
+            code=200,
+            router=request.url.path,
+            data={
+                "message": f"Cookie (指纹: {fingerprint}) {'已删除' if removed else '未找到'}",
+                "removed": removed,
+                "pool_status": status,
+            }
+        )
+    except Exception as e:
+        status_code = 400
+        detail = ErrorResponseModel(code=status_code,
+                                    message=str(e),
+                                    router=request.url.path,
+                                    params=dict(request.query_params),
+                                    )
+        raise HTTPException(status_code=status_code, detail=detail.dict())
+
+
+# 一键清理所有 dead Cookie
+@router.post("/cleanup_dead_cookies",
+             response_model=ResponseModel,
+             summary="清理所有失效Cookie/Cleanup all dead cookies")
+async def cleanup_dead_cookies_api(request: Request,
+                                    service: str = Body(default="douyin", description="服务名称/Service name")):
+    """
+    # [中文]
+    ### 用途:
+    - 一键清理指定服务 Cookie 池中所有标记为 dead 的 Cookie。
+    ### 参数:
+    - service: 服务名称 (douyin / tiktok)
+    ### 返回:
+    - 清理数量及池状态
+
+    # [English]
+    ### Purpose:
+    - Remove all dead cookies from the specified service's pool.
+    ### Parameters:
+    - service: Service name (douyin / tiktok)
+    ### Return:
+    - Number removed and pool status
+    """
+    try:
+        if service not in ("douyin", "tiktok"):
+            raise ValueError(f"不支持的服务 '{service}'。支持的服务: douyin, tiktok")
+
+        pool = CookiePool.get_instance(service)
+        removed = await pool.cleanup_dead()
+        status = await pool.get_pool_status()
+
+        return ResponseModel(
+            code=200,
+            router=request.url.path,
+            data={
+                "message": f"清理了 {removed} 个 dead Cookie",
+                "removed": removed,
+                "pool_status": status,
+            }
+        )
+    except Exception as e:
+        status_code = 400
+        detail = ErrorResponseModel(code=status_code,
+                                    message=str(e),
                                     router=request.url.path,
                                     params=dict(request.query_params),
                                     )
@@ -196,6 +303,7 @@ async def extract_browser_cookies_api(request: Request,
     except Exception as e:
         status_code = 400
         detail = ErrorResponseModel(code=status_code,
+                                    message=str(e),
                                     router=request.url.path,
                                     params=dict(request.query_params),
                                     )

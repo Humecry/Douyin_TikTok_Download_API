@@ -322,6 +322,32 @@ class CookiePool:
                     return True
         return False
 
+    async def cleanup_dead(self) -> int:
+        """清理所有 dead 状态的 Cookie，返回清理数量"""
+        async with self._lock:
+            before = len(self._cookies)
+            self._cookies = [c for c in self._cookies if c.status != "dead"]
+            after = len(self._cookies)
+            removed = before - after
+            if removed > 0:
+                self._save()
+                logger.info(
+                    f"[CookiePool:{self.service}] 清理了 {removed} 个 dead Cookie, "
+                    f"剩余 {after} 个"
+                )
+            return removed
+
+    async def clear_all(self) -> int:
+        """清空池中所有 Cookie，返回清理数量"""
+        async with self._lock:
+            count = len(self._cookies)
+            self._cookies.clear()
+            self._save()
+            logger.info(
+                f"[CookiePool:{self.service}] 已清空全部 {count} 个 Cookie"
+            )
+            return count
+
     # ------------------------------------------------------------------
     # 自动获取
     # ------------------------------------------------------------------
@@ -503,10 +529,12 @@ def is_cookie_failure_response(status_code: int, response_body: str = "") -> boo
     """
     判断响应是否表明 Cookie 失效。
 
-    检测条件:
-    - HTTP 401 (未授权)
-    - HTTP 403 + 响应体包含风控特征
-    - 响应体包含登录/验证提示
+    检测条件（严格模式，避免误杀健康 Cookie）:
+    - HTTP 401: 明确未授权，Cookie 一定失效
+    - HTTP 403 + 风控验证特征: captcha / 滑块 / 验证码（而非泛化的 "登录" 提示）
+
+    注意：不匹配 "login" / "登录" / "sign in" 等宽泛关键词，
+    因为正常接口也可能返回 "请登录" 的 403 提示而 Cookie 本身是有效的。
 
     Args:
         status_code: HTTP 状态码
@@ -515,14 +543,15 @@ def is_cookie_failure_response(status_code: int, response_body: str = "") -> boo
     Returns:
         是否可能是 Cookie 失效
     """
-    if status_code in (401,):
+    if status_code == 401:
         return True
 
     if status_code == 403:
         body_lower = response_body.lower() if response_body else ""
+        # 仅匹配风控验证特征，不匹配泛化的 "登录" 提示
         risk_indicators = [
-            "captcha", "验证", "滑块", "verify", "login", "登录",
-            "请先登录", "sign in", "too many requests", "频繁",
+            "captcha", "滑块", "verify", "验证码",
+            "slide", "security", "风控",
         ]
         if any(indicator in body_lower for indicator in risk_indicators):
             return True

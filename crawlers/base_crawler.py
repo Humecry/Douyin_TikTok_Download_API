@@ -55,10 +55,11 @@ from crawlers.utils.cookie_manager import is_cookie_failure_response
 
 
 class CookieFailureError(APIError):
-    """当检测到 Cookie 失效时抛出，调用方可据此切换 Cookie 重试"""
+    """当检测到 Cookie 失效时抛出，调用方可据此切换 Cookie 重试。
+    注意：不调用 super().__init__ 以避免打印 "程序出现异常" —— Cookie 失效是运营事件。"""
 
     def __init__(self, message: str = "", status_code: int = None, response_body: str = ""):
-        super().__init__(status_code)
+        self.status_code = status_code
         self.message = message
         self.response_body = response_body
 
