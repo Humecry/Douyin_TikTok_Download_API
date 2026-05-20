@@ -71,8 +71,8 @@ with open(f"{path}/config.yaml", "r", encoding="utf-8") as f:
 
 # Cookie 池单例（模块级，全局共享）
 _cookie_pool = CookiePool.get_instance("douyin")
-# 从 config.yaml 种子（向后兼容）
-_cookie_pool.seed_from_config(config, f"{path}/config.yaml")
+# 从 config.yaml 种子（已禁用——Cookie 完全由 API 手动管理）
+# _cookie_pool.seed_from_config(config, f"{path}/config.yaml")  # 已禁用——Cookie 由 API 手动管理
 
 # Cookie 轮转最大尝试次数
 COOKIE_RETRY_MAX = 3
